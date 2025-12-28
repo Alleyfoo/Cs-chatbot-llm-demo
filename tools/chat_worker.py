@@ -76,7 +76,7 @@ CHAT_NUMERIC_COLUMNS = {"language_confidence", "latency_seconds", "quality_score
 
 CHAT_JSON_COLUMNS = {"conversation_tags", "matched", "missing", "response_payload", "response_metadata"}
 
-USE_DB_QUEUE = os.environ.get("USE_DB_QUEUE", "false").lower() == "true"
+USE_DB_QUEUE = os.environ.get("USE_DB_QUEUE", "true").lower() == "true"
 
 
 def _load_queue(queue_path: Path) -> pd.DataFrame:
@@ -260,18 +260,16 @@ def _conversation_history_from_records(rows: List[Dict[str, Any]], limit: int = 
         return []
     messages: List[ChatMessage] = []
     for row in rows[-limit:]:
-        direction = str(row.get("message_direction", "")).lower()
-        role = "system"
-        if direction == "inbound":
-            role = "user"
-        elif direction in ("outbound", "assistant"):
-            role = "assistant"
-        content = str(row.get("payload", "") or row.get("body", ""))
+        role = str(row.get("role") or row.get("message_direction") or "").lower()
+        if role not in ("user", "assistant"):
+            direction = role
+            role = "assistant" if direction in ("outbound", "assistant") else "user"
+        content = str(row.get("content") or row.get("payload", "") or row.get("body", ""))
         metadata = {
             "delivery_status": str(row.get("delivery_status", "")),
             "channel": str(row.get("channel", "")),
         }
-        finished_at = str(row.get("finished_at", "") or row.get("created_at", ""))
+        finished_at = str(row.get("created_at", "") or row.get("finished_at", "") or row.get("started_at", ""))
         timestamp = datetime.fromisoformat(finished_at.replace("Z", "+00:00")) if finished_at else datetime.now(timezone.utc)
         messages.append(ChatMessage(role=role, content=content, timestamp=timestamp, metadata=metadata))
     return messages
@@ -291,7 +289,7 @@ def _process_once_db(*, processor_id: str, chat_service: ChatService) -> bool:
     if not user_text:
         user_text = "Hi"
     metadata = _compose_metadata_mapping(row)
-    history_rows = queue_db.get_conversation_history(conversation_id, exclude_id=row.get("id"))
+    history_rows = queue_db.get_conversation_history(conversation_id, limit=6)
     history = _conversation_history_from_records(history_rows)
 
     user_message = ChatMessage(role="user", content=user_text, metadata=metadata)
@@ -307,6 +305,9 @@ def _process_once_db(*, processor_id: str, chat_service: ChatService) -> bool:
         end_user_handle=str(row.get("end_user_handle") or row.get("customer") or ""),
         channel=str(row.get("channel") or "web_chat"),
     )
+
+    queue_db.append_history(conversation_id, "user", user_text)
+    queue_db.append_history(conversation_id, "assistant", result.response.content)
 
     finished_at = datetime.now(timezone.utc).isoformat()
     matched = record.get("matched") or (result.evaluation.get("matched") if result.evaluation else None)

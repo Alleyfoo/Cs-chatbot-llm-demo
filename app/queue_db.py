@@ -36,8 +36,18 @@ CREATE TABLE IF NOT EXISTS queue (
     ingest_signature TEXT,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS conversation_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_status ON queue(status);
 CREATE INDEX IF NOT EXISTS idx_conversation ON queue(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_history_conversation ON conversation_history(conversation_id, created_at);
 """
 
 ALLOWED_UPDATE_FIELDS = {
@@ -213,17 +223,67 @@ def get_conversation_history(conversation_id: str, *, limit: int = 6, exclude_id
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT * FROM queue
+            SELECT conversation_id, role, content, created_at
+            FROM conversation_history
             WHERE conversation_id = ?
-              AND (? IS NULL OR id != ?)
-            ORDER BY COALESCE(finished_at, created_at) ASC
+            ORDER BY created_at DESC
+            LIMIT ?
             """,
-            (conversation_id, exclude_id, exclude_id),
+            (conversation_id, max(limit, 1)),
         )
         rows = cursor.fetchall()
         if not rows:
             return []
-        return [_row_to_dict(row) for row in rows][-limit:]
+        ordered = list(reversed(rows))
+        return [_row_to_dict(row) for row in ordered]
+    finally:
+        conn.close()
+
+
+def append_history(conversation_id: str, role: str, content: str) -> None:
+    """Append a single message into the conversation_history table."""
+    if not conversation_id or not role or not content:
+        return
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO conversation_history (conversation_id, role, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (conversation_id, role, content, _now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def bulk_append_history(messages: List[Dict[str, str]]) -> None:
+    """Append many messages at once."""
+    if not messages:
+        return
+    payloads = [
+        (
+            msg.get("conversation_id"),
+            msg.get("role"),
+            msg.get("content"),
+            msg.get("created_at") or _now_iso(),
+        )
+        for msg in messages
+        if msg.get("conversation_id") and msg.get("role") and msg.get("content")
+    ]
+    if not payloads:
+        return
+    conn = get_connection()
+    try:
+        conn.executemany(
+            """
+            INSERT INTO conversation_history (conversation_id, role, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            payloads,
+        )
+        conn.commit()
     finally:
         conn.close()
 

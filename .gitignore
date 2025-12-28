@@ -15,3 +15,4 @@ data/approved_sent_log.csv
 data/**
 !data/.gitkeep
 notebooks/data/
+.env

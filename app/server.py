@@ -1,23 +1,68 @@
 import os
+import socket
 from pathlib import Path
 from typing import Any, Dict
+from urllib.parse import urlparse
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
 
+from . import config, queue_db
 from .pipeline import run_pipeline
-from .schemas import EmailRequest, EmailResponse
-from . import queue_db
+from .schemas import ChatEnqueueRequest, EmailRequest, EmailResponse
 from tools import chat_ingest
 
 app = FastAPI()
 MODEL_READY = True
 CHAT_QUEUE_PATH = Path("data/email_queue.xlsx")
-USE_DB_QUEUE = os.environ.get("USE_DB_QUEUE", "false").lower() == "true"
+USE_DB_QUEUE = os.environ.get("USE_DB_QUEUE", "true").lower() == "true"
+API_KEY_NAME = "X-API-KEY"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+
+def _get_api_key(api_key_header: str = Security(api_key_header)) -> str:
+    if not config.REQUIRE_API_KEY:
+        return api_key_header or ""
+    expected = config.INGEST_API_KEY
+    if not expected:
+        raise HTTPException(status_code=503, detail="API key not configured")
+    if api_key_header != expected:
+        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
+    return api_key_header
+
+
+def _check_db() -> bool:
+    try:
+        conn = queue_db.get_connection()
+        conn.execute("SELECT 1")
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def _check_ollama() -> bool:
+    parsed = urlparse(config.OLLAMA_HOST)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 11434
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except OSError:
+        return False
 
 
 @app.get("/healthz")
 def healthz() -> Dict[str, Any]:
-    return {"status": "ok", "model_loaded": MODEL_READY}
+    db_ok = _check_db()
+    ollama_ok = _check_ollama()
+    status_code = 200 if (MODEL_READY and db_ok and ollama_ok) else 503
+    if status_code != 200:
+        raise HTTPException(
+            status_code=status_code,
+            detail={"model_loaded": MODEL_READY, "db": db_ok, "ollama": ollama_ok},
+        )
+    return {"status": "ok", "model_loaded": MODEL_READY, "db": db_ok, "ollama": ollama_ok}
 
 
 @app.post("/reply", response_model=EmailResponse)
@@ -33,13 +78,15 @@ def reply(req: EmailRequest) -> EmailResponse:
     return EmailResponse(**result)
 
 
-@app.post("/chat/enqueue")
-def enqueue_chat(payload: Dict[str, Any]) -> Dict[str, int]:
+@app.post("/chat/enqueue", dependencies=[Depends(_get_api_key)])
+def enqueue_chat(payload: ChatEnqueueRequest) -> Dict[str, int]:
     message = {
-        "conversation_id": payload.get("conversation_id") or "api-web",
-        "text": payload.get("text") or payload.get("message") or "",
-        "end_user_handle": payload.get("end_user_handle") or payload.get("user") or "api-user",
-        "channel": payload.get("channel") or "web_chat",
+        "conversation_id": payload.conversation_id or "api-web",
+        "text": payload.text,
+        "end_user_handle": payload.end_user_handle or "api-user",
+        "channel": payload.channel or "web_chat",
+        "message_id": payload.message_id or "",
+        "raw_payload": payload.raw_payload or "",
     }
     if USE_DB_QUEUE:
         queue_id = queue_db.insert_message(message)

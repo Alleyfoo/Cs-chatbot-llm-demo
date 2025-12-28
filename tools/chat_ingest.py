@@ -16,7 +16,7 @@ from app import queue_db
 from tools import chat_worker
 from tools.process_queue import save_queue
 
-USE_DB_QUEUE = os.environ.get("USE_DB_QUEUE", "false").lower() == "true"
+USE_DB_QUEUE = os.environ.get("USE_DB_QUEUE", "true").lower() == "true"
 
 
 def _load_queue(queue_path: Path) -> pd.DataFrame:

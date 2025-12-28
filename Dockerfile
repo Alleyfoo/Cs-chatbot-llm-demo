@@ -2,18 +2,23 @@ FROM python:3.12-slim
 
 # System dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential cmake && \
+    apt-get install -y --no-recommends build-essential cmake && \
     rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
 
 # Python dependencies
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
-# Model volume and environment
-RUN mkdir -p /models
+# Application code and data directories
+COPY . /workspace
+RUN mkdir -p /workspace/data /models
 VOLUME /models
-ENV MODEL_PATH=/models/model.gguf
 
-WORKDIR /workspace
+# Environment defaults
+ENV MODEL_PATH=/models/model.gguf \
+    USE_DB_QUEUE=true \
+    QUEUE_DB_PATH=/workspace/data/queue.db
 
-CMD ["bash"]
+CMD ["uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "8000"]
