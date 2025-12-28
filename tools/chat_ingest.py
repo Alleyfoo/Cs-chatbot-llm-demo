@@ -5,14 +5,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List
 
 import pandas as pd
 
+from app import queue_db
 from tools import chat_worker
 from tools.process_queue import save_queue
+
+USE_DB_QUEUE = os.environ.get("USE_DB_QUEUE", "false").lower() == "true"
 
 
 def _load_queue(queue_path: Path) -> pd.DataFrame:
@@ -48,7 +52,6 @@ def _make_row(
 
 
 def ingest_messages(queue_path: Path, messages: Iterable[dict]) -> int:
-    queue_df = _load_queue(queue_path)
     rows = []
     for message in messages:
         conversation_id = str(message.get("conversation_id") or f"demo-{datetime.now(timezone.utc).timestamp():.0f}")
@@ -58,11 +61,33 @@ def ingest_messages(queue_path: Path, messages: Iterable[dict]) -> int:
         end_user_handle = str(message.get("end_user_handle") or "demo-user")
         channel = str(message.get("channel") or "web_chat")
         row = _make_row(conversation_id, text, end_user_handle=end_user_handle, channel=channel)
+        row["raw_payload"] = str(message.get("raw_payload") or "")
+        row["ingest_signature"] = str(message.get("ingest_signature") or "")
+        if message.get("message_id"):
+            row["message_id"] = str(message.get("message_id"))
         rows.append(row)
 
     if not rows:
         return 0
 
+    if USE_DB_QUEUE:
+        for row in rows:
+            queue_db.insert_message(
+                {
+                    "message_id": row.get("message_id") or "",
+                    "conversation_id": row.get("conversation_id"),
+                    "end_user_handle": row.get("end_user_handle"),
+                    "channel": row.get("channel"),
+                    "message_direction": row.get("message_direction", "inbound"),
+                    "message_type": row.get("message_type", "text"),
+                    "text": row.get("payload", ""),
+                    "raw_payload": row.get("raw_payload", ""),
+                    "ingest_signature": row.get("ingest_signature", ""),
+                }
+            )
+        return len(rows)
+
+    queue_df = _load_queue(queue_path)
     combined = pd.concat([queue_df, pd.DataFrame(rows)], ignore_index=True)
     save_queue(queue_path, combined)
     return len(rows)

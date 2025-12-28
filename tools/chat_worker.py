@@ -5,14 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import pandas as pd
 
+from app import queue_db
 from app.chat_service import ChatMessage, ChatService
 from tools.process_queue import save_queue
 
@@ -73,6 +75,8 @@ CHAT_STRING_COLUMNS = {
 CHAT_NUMERIC_COLUMNS = {"language_confidence", "latency_seconds", "quality_score"}
 
 CHAT_JSON_COLUMNS = {"conversation_tags", "matched", "missing", "response_payload", "response_metadata"}
+
+USE_DB_QUEUE = os.environ.get("USE_DB_QUEUE", "false").lower() == "true"
 
 
 def _load_queue(queue_path: Path) -> pd.DataFrame:
@@ -176,6 +180,9 @@ def _claim_row(df: pd.DataFrame, processor_id: str) -> Optional[int]:
 
 def process_once(queue_path: Path, *, processor_id: str, chat_service: Optional[ChatService] = None) -> bool:
     chat_service = chat_service or ChatService()
+    if USE_DB_QUEUE:
+        return _process_once_db(processor_id=processor_id, chat_service=chat_service)
+
     df = _load_queue(queue_path)
     idx = _claim_row(df, processor_id)
     if idx is None:
@@ -234,6 +241,106 @@ def process_once(queue_path: Path, *, processor_id: str, chat_service: Optional[
 
     status = df.loc[idx, "status"]
     print(f"Processed conversation {conversation_id} -> status={status} latency={elapsed:.3f}s")
+    return True
+
+
+def _compose_metadata_mapping(row: Dict[str, Any]) -> Dict[str, str]:
+    metadata: Dict[str, str] = {}
+    for key in ("language", "language_source", "language_confidence", "conversation_tags", "ingest_signature"):
+        value = row.get(key)
+        if value is None:
+            continue
+        metadata[key] = str(value)
+    metadata["raw"] = str(row.get("raw_payload", ""))
+    return metadata
+
+
+def _conversation_history_from_records(rows: List[Dict[str, Any]], limit: int = 6) -> List[ChatMessage]:
+    if not rows:
+        return []
+    messages: List[ChatMessage] = []
+    for row in rows[-limit:]:
+        direction = str(row.get("message_direction", "")).lower()
+        role = "system"
+        if direction == "inbound":
+            role = "user"
+        elif direction in ("outbound", "assistant"):
+            role = "assistant"
+        content = str(row.get("payload", "") or row.get("body", ""))
+        metadata = {
+            "delivery_status": str(row.get("delivery_status", "")),
+            "channel": str(row.get("channel", "")),
+        }
+        finished_at = str(row.get("finished_at", "") or row.get("created_at", ""))
+        timestamp = datetime.fromisoformat(finished_at.replace("Z", "+00:00")) if finished_at else datetime.now(timezone.utc)
+        messages.append(ChatMessage(role=role, content=content, timestamp=timestamp, metadata=metadata))
+    return messages
+
+
+def _process_once_db(*, processor_id: str, chat_service: ChatService) -> bool:
+    row = queue_db.claim_row(processor_id)
+    if not row:
+        return False
+
+    started_at = row.get("started_at") or datetime.now(timezone.utc).isoformat()
+    conversation_id = str(row.get("conversation_id") or row.get("ingest_signature") or row.get("message_id") or uuid4())
+    if not row.get("conversation_id"):
+        queue_db.update_row_status(row["id"], status="processing", conversation_id=conversation_id)
+
+    user_text = str(row.get("payload") or row.get("body") or row.get("raw_payload") or row.get("text") or "").strip()
+    if not user_text:
+        user_text = "Hi"
+    metadata = _compose_metadata_mapping(row)
+    history_rows = queue_db.get_conversation_history(conversation_id, exclude_id=row.get("id"))
+    history = _conversation_history_from_records(history_rows)
+
+    user_message = ChatMessage(role="user", content=user_text, metadata=metadata)
+
+    start = time.perf_counter()
+    result = chat_service.respond(history, user_message, conversation_id=conversation_id, channel=str(row.get("channel") or "web_chat"))
+    elapsed = time.perf_counter() - start
+
+    record = chat_service.build_queue_record(
+        user_message,
+        result,
+        conversation_id=conversation_id,
+        end_user_handle=str(row.get("end_user_handle") or row.get("customer") or ""),
+        channel=str(row.get("channel") or "web_chat"),
+    )
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+    matched = record.get("matched") or (result.evaluation.get("matched") if result.evaluation else None)
+    missing = record.get("missing") or (result.evaluation.get("missing") if result.evaluation else None)
+    response_payload = record.get("response_payload") or {"type": "text", "content": result.response.content}
+    response_metadata = record.get("response_metadata") or result.evaluation
+
+    queue_db.update_row_status(
+        row_id=row["id"],
+        status=record.get("status", "responded"),
+        message_id=record.get("message_id", row.get("message_id") or str(uuid4())),
+        conversation_id=conversation_id,
+        end_user_handle=record.get("end_user_handle", ""),
+        channel=record.get("channel", "web_chat"),
+        message_direction="inbound",
+        message_type=row.get("message_type", "text"),
+        payload=user_text,
+        raw_payload=row.get("raw_payload", ""),
+        processor_id=processor_id,
+        started_at=started_at,
+        finished_at=finished_at,
+        latency_seconds=elapsed,
+        quality_score=record.get("quality_score"),
+        matched=matched,
+        missing=missing,
+        response_payload=response_payload,
+        response_metadata=response_metadata,
+        delivery_route=record.get("delivery_route", ""),
+        delivery_status=record.get("delivery_status", "pending"),
+        ingest_signature=row.get("ingest_signature", ""),
+    )
+
+    status = record.get("status", "responded")
+    print(f"[db] Processed conversation {conversation_id} -> status={status} latency={elapsed:.3f}s")
     return True
 
 

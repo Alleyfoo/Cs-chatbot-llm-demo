@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -5,11 +6,13 @@ from fastapi import FastAPI
 
 from .pipeline import run_pipeline
 from .schemas import EmailRequest, EmailResponse
+from . import queue_db
 from tools import chat_ingest
 
 app = FastAPI()
 MODEL_READY = True
 CHAT_QUEUE_PATH = Path("data/email_queue.xlsx")
+USE_DB_QUEUE = os.environ.get("USE_DB_QUEUE", "false").lower() == "true"
 
 
 @app.get("/healthz")
@@ -38,5 +41,9 @@ def enqueue_chat(payload: Dict[str, Any]) -> Dict[str, int]:
         "end_user_handle": payload.get("end_user_handle") or payload.get("user") or "api-user",
         "channel": payload.get("channel") or "web_chat",
     }
+    if USE_DB_QUEUE:
+        queue_id = queue_db.insert_message(message)
+        return {"enqueued": 1, "queue_id": queue_id}
+
     count = chat_ingest.ingest_messages(CHAT_QUEUE_PATH, [message])
     return {"enqueued": count}
